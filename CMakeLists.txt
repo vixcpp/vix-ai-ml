@@ -2,7 +2,6 @@
 add_library(vix_ai_ml
   src/Dataset.cpp
   src/Model.cpp
-  src/LinearRegression.cpp
   src/Regression.cpp
   src/Clustering.cpp
 )
