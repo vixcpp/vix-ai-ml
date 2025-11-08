@@ -4,69 +4,50 @@
 #include <random>
 #include <limits>
 #include <iomanip>
+#include <algorithm> // shuffle, max_element
+#include <cmath>     // std::abs
 
 namespace vix::ai::ml
 {
 
-    /**
-     * @brief Ordinary Least Squares (OLS) linear regression.
-     *
-     * This model fits a linear function y ≈ w·x + b by minimizing the mean squared error (MSE)
-     * using (mini-)batch gradient descent. It supports:
-     *  - Multi-feature inputs (X: n_samples x n_features)
-     *  - Serialization (save/load) of learned parameters
-     *  - A convenience 1D constructor (a, b) and predict_scalar(x) for quick demos
-     *
-     * Typical usage:
-     * @code
-     * LinearRegression lr;
-     * lr.set_hyperparams(0.1, 3000);
-     * lr.fit(X, y);
-     * auto yhat = lr.predict(Xtest);
-     * @endcode
-     *
-     * Convenience 1D usage:
-     * @code
-     * LinearRegression lr(2.0, 1.0); // y ≈ 2x + 1
-     * double v = lr.predict_scalar(4.0); // ~9.0
-     * @endcode
-     *
-     * Notes:
-     *  - This MVP uses plain gradient descent (no regularization, no adaptive LR).
-     *  - Features are assumed to be on comparable scales; consider standardizing X.
-     *  - For large-scale problems, prefer minibatching or closed-form solutions when viable.
-     */
     class LinearRegression final : public Model
     {
     public:
-        /**
-         * @brief Default constructor: parameters are uninitialized (w = {}, b = 0).
-         *        Call fit() before using predict(), unless you set weights by another means.
-         */
         LinearRegression() = default;
 
-        /**
-         * @brief Convenience 1D constructor that initializes a single-weight model y ≈ a*x + b.
-         * @param a Slope for the single-feature case.
-         * @param b Intercept term.
-         *
-         * This is intended for quick demos/tests. Internally it sets w_ = {a} and b_ = b.
-         * Multi-feature training via fit() remains fully supported.
-         */
+        // Convenience 1D : y ~= a*x + b
         LinearRegression(double a, double b)
         {
             w_.assign(1, a);
             b_ = b;
         }
 
-        /**
-         * @brief Fit the model using batch gradient descent on MSE.
-         * @param X Feature matrix (n_samples x n_features).
-         * @param y Target vector (n_samples).
-         *
-         * Complexity: O(iters * n_samples * n_features).
-         * Assumes X has consistent row sizes. If n_features == 0 or sizes mismatch, fit() is a no-op.
-         */
+        // -----------------------------
+        // Hyperparamètres “prod”
+        // -----------------------------
+        void set_hyperparams(double lr,
+                             std::size_t iters,
+                             std::size_t batch_size = 0, // 0 => full batch
+                             double l2 = 0.0,            // régularisation L2 (ridge)
+                             bool shuffle = true,
+                             double tol = 1e-8,            // min amélioration (early stop)
+                             std::size_t patience = 20,    // iters sans amélioration
+                             std::size_t verbose_every = 0 // 0 = silencieux
+        )
+        {
+            learning_rate_ = lr;
+            max_iters_ = iters;
+            batch_size_ = batch_size;
+            l2_ = l2;
+            shuffle_ = shuffle;
+            tol_ = tol;
+            patience_ = patience;
+            verbose_every_ = verbose_every;
+        }
+
+        // -----------------------------
+        // Entraînement : Gradient Descent (mini-batch possible)
+        // -----------------------------
         void fit(const Mat &X, const Vec &y) override
         {
             const std::size_t m = nrows(X);
@@ -76,64 +57,161 @@ namespace vix::ai::ml
 
             w_.assign(d, 0.0);
             b_ = 0.0;
+
+            std::vector<std::size_t> idx(m);
+            for (std::size_t i = 0; i < m; ++i)
+                idx[i] = i;
+
+            std::mt19937 rng(42);
+
             const double lr = learning_rate_;
             const std::size_t iters = max_iters_;
+            const std::size_t B = (batch_size_ == 0 || batch_size_ > m) ? m : batch_size_;
+
+            // Early stopping
+            double best_loss = std::numeric_limits<double>::infinity();
+            std::size_t bad_rounds = 0;
+            Mat batchX;
+            Vec batchY;
 
             for (std::size_t it = 0; it < iters; ++it)
             {
-                // gradients
-                Vec gw(d, 0.0);
-                double gb = 0.0;
-                for (std::size_t i = 0; i < m; ++i)
+                if (shuffle_)
+                    std::shuffle(idx.begin(), idx.end(), rng);
+
+                // itération sur mini-batches
+                for (std::size_t start = 0; start < m; start += B)
                 {
-                    const double yhat = dot(X[i], w_) + b_;
-                    const double err = yhat - y[i];
+                    const std::size_t end = std::min(start + B, m);
+                    const std::size_t curB = end - start;
+
+                    // Préparer batch
+                    batchX.assign(curB, Vec(d, 0.0));
+                    batchY.assign(curB, 0.0);
+                    for (std::size_t r = 0; r < curB; ++r)
+                    {
+                        const auto i = idx[start + r];
+                        batchX[r] = X[i];
+                        batchY[r] = y[i];
+                    }
+
+                    // gradients
+                    Vec gw(d, 0.0);
+                    double gb = 0.0;
+
+                    for (std::size_t r = 0; r < curB; ++r)
+                    {
+                        const double yhat = dot(batchX[r], w_) + b_;
+                        const double err = yhat - batchY[r];
+                        for (std::size_t j = 0; j < d; ++j)
+                            gw[j] += err * batchX[r][j];
+                        gb += err;
+                    }
+
+                    const double invB = 1.0 / static_cast<double>(curB);
+
+                    // Ajout régularisation L2 sur w (pas sur b)
+                    if (l2_ > 0.0)
+                    {
+                        for (std::size_t j = 0; j < d; ++j)
+                            gw[j] += l2_ * w_[j] * static_cast<double>(curB);
+                    }
+
+                    // Pas de gradient (moyenne)
                     for (std::size_t j = 0; j < d; ++j)
-                        gw[j] += err * X[i][j];
-                    gb += err;
+                        w_[j] -= lr * (gw[j] * invB);
+                    b_ -= lr * (gb * invB);
                 }
-                const double inv_m = 1.0 / static_cast<double>(m);
-                for (std::size_t j = 0; j < d; ++j)
-                    w_[j] -= lr * (gw[j] * inv_m);
-                b_ -= lr * (gb * inv_m);
+
+                // Early stopping : calcul de la loss (MSE + L2)
+                const double cur_loss = loss_with_l2(X, y);
+                if (verbose_every_ && (it % verbose_every_ == 0))
+                {
+                    // std::cout << "[it=" << it << "] loss=" << cur_loss << "\n";
+                }
+
+                const double gain = best_loss - cur_loss;
+                if (gain > tol_)
+                {
+                    best_loss = cur_loss;
+                    bad_rounds = 0;
+                }
+                else
+                {
+                    if (++bad_rounds >= patience_)
+                        break; // stop anticipé
+                }
             }
         }
 
-        /**
-         * @brief Predict a single sample (vector) x -> yhat.
-         * @param x Feature vector (size == n_features).
-         * @return Predicted scalar output.
-         */
-        double predict_one(const Vec &x) const override { return dot(x, w_) + b_; }
-
-        /**
-         * @brief Scalar helper for the 1D case (x is treated as a single-feature vector).
-         * @param x Single scalar feature.
-         * @return Predicted scalar output.
-         *
-         * Uses predict_one({x}) so it remains consistent with the base Model API.
-         */
-        double predict_scalar(double x) const { return predict_one(Vec{x}); }
-
-        /**
-         * @brief Set basic optimization hyperparameters.
-         * @param lr    Learning rate for gradient descent.
-         * @param iters Number of gradient steps.
-         */
-        void set_hyperparams(double lr, std::size_t iters)
+        // -----------------------------
+        // Forme fermée (Normal Equation) avec Ridge
+        // -----------------------------
+        // Résout argmin ||Xw + b - y||^2 + l2*||w||^2
+        // Implémentation : on ajoute une colonne de 1 à X (pour le biais),
+        // puis on résout (Z^T Z + Lambda) theta = Z^T y,
+        // avec Lambda = diag(l2, ..., l2, 0) — pas de L2 sur le biais.
+        void fit_closed_form(const Mat &X, const Vec &y, double l2 = 0.0)
         {
-            learning_rate_ = lr;
-            max_iters_ = iters;
+            const std::size_t m = nrows(X);
+            const std::size_t d = ncols(X);
+            if (m == 0 || d == 0 || y.size() != m)
+                return;
+
+            // Construire Z = [X | 1]
+            Mat Z(m, Vec(d + 1, 0.0));
+            for (std::size_t i = 0; i < m; ++i)
+            {
+                for (std::size_t j = 0; j < d; ++j)
+                    Z[i][j] = X[i][j];
+                Z[i][d] = 1.0; // colonne de 1 pour le biais
+            }
+
+            // A = Z^T Z, b = Z^T y
+            Mat A(d + 1, Vec(d + 1, 0.0));
+            Vec bvec(d + 1, 0.0);
+
+            for (std::size_t i = 0; i < d + 1; ++i)
+            {
+                for (std::size_t j = i; j < d + 1; ++j)
+                {
+                    double s = 0.0;
+                    for (std::size_t r = 0; r < m; ++r)
+                        s += Z[r][i] * Z[r][j];
+                    A[i][j] = A[j][i] = s;
+                }
+                double t = 0.0;
+                for (std::size_t r = 0; r < m; ++r)
+                    t += Z[r][i] * y[r];
+                bvec[i] = t;
+            }
+
+            // Régularisation : L2 sur les d premières diag (poids), pas sur biais (dernier)
+            if (l2 > 0.0)
+            {
+                for (std::size_t j = 0; j < d; ++j)
+                    A[j][j] += l2;
+            }
+
+            // Résoudre A * theta = bvec (Gauss avec pivot partiel)
+            Vec theta = gaussian_solve(A, bvec); // taille d+1
+
+            // Séparer w et b
+            w_.assign(d, 0.0);
+            for (std::size_t j = 0; j < d; ++j)
+                w_[j] = theta[j];
+            b_ = theta[d];
         }
 
-        /**
-         * @brief Save learned parameters in a simple text format.
-         * @param os Output stream.
-         *
-         * Format:
-         *   <d> <b>\n
-         *   w0 w1 ... w(d-1)\n
-         */
+        // -----------------------------
+        // Prédiction
+        // -----------------------------
+        double predict_one(const Vec &x) const override { return dot(x, w_) + b_; }
+        double predict_scalar(double x) const { return predict_one(Vec{x}); }
+
+        // -----------------------------
+        // Sérialisation (format inchangé)
+        // -----------------------------
         void save(std::ostream &os) const override
         {
             os << std::setprecision(17) << w_.size() << " " << b_ << "\n";
@@ -142,10 +220,6 @@ namespace vix::ai::ml
             os << "\n";
         }
 
-        /**
-         * @brief Load model parameters saved via save().
-         * @param is Input stream.
-         */
         void load(std::istream &is) override
         {
             std::size_t d = 0;
@@ -155,23 +229,118 @@ namespace vix::ai::ml
                 is >> w_[j];
         }
 
+        // Accès utilitaires
+        const Vec &weights() const noexcept { return w_; }
+        double bias() const noexcept { return b_; }
+        double l2() const noexcept { return l2_; }
+
     private:
+        // --- helpers numériques ---
         static double dot(const Vec &a, const Vec &b)
         {
-            double s = 0;
+            double s = 0.0;
             const std::size_t d = a.size();
             for (std::size_t j = 0; j < d; ++j)
                 s += a[j] * b[j];
             return s;
         }
 
-        Vec w_;                       ///< Weight vector (size = n_features). For 1D convenience ctor, size = 1.
-        double b_{0.0};               ///< Intercept term.
-        double learning_rate_{0.05};  ///< Learning rate for gradient descent.
-        std::size_t max_iters_{2000}; ///< Number of gradient steps.
+        double mse_only(const Mat &X, const Vec &y) const
+        {
+            const std::size_t m = nrows(X);
+            if (m == 0)
+                return 0.0;
+            double s = 0.0;
+            for (std::size_t i = 0; i < m; ++i)
+            {
+                const double e = (dot(X[i], w_) + b_) - y[i];
+                s += e * e;
+            }
+            return s / static_cast<double>(m);
+        }
+
+        double loss_with_l2(const Mat &X, const Vec &y) const
+        {
+            double loss = mse_only(X, y);
+            if (l2_ > 0.0)
+            {
+                double norm2 = 0.0;
+                for (double wi : w_)
+                    norm2 += wi * wi;
+                loss += l2_ * norm2; // biais non régularisé
+            }
+            return loss;
+        }
+
+        // Solveur linéaire très simple : Gauss avec pivot partiel
+        static Vec gaussian_solve(Mat A, Vec b)
+        {
+            const std::size_t n = A.size();
+            // Augmenter [A|b]
+            for (std::size_t i = 0; i < n; ++i)
+                A[i].push_back(b[i]);
+
+            // Elimination
+            for (std::size_t col = 0; col < n; ++col)
+            {
+                // pivot partiel
+                std::size_t piv = col;
+                double best = std::abs(A[col][col]);
+                for (std::size_t r = col + 1; r < n; ++r)
+                {
+                    double v = std::abs(A[r][col]);
+                    if (v > best)
+                    {
+                        best = v;
+                        piv = r;
+                    }
+                }
+                if (best == 0.0)
+                    continue; // singulier (on laisse passer)
+
+                if (piv != col)
+                    std::swap(A[piv], A[col]);
+
+                // normaliser ligne
+                const double diag = A[col][col];
+                for (std::size_t c = col; c <= n; ++c)
+                    A[col][c] /= diag;
+
+                // éliminer autres lignes
+                for (std::size_t r = 0; r < n; ++r)
+                {
+                    if (r == col)
+                        continue;
+                    const double f = A[r][col];
+                    if (f == 0.0)
+                        continue;
+                    for (std::size_t c = col; c <= n; ++c)
+                        A[r][c] -= f * A[col][c];
+                }
+            }
+
+            Vec x(n, 0.0);
+            for (std::size_t i = 0; i < n; ++i)
+                x[i] = A[i][n];
+            return x;
+        }
+
+        // --- paramètres ---
+        Vec w_;
+        double b_{0.0};
+
+        // hyperparams
+        double learning_rate_{0.05};
+        std::size_t max_iters_{2000};
+        std::size_t batch_size_{0};
+        double l2_{0.0};
+        bool shuffle_{true};
+        double tol_{1e-8};
+        std::size_t patience_{20};
+        std::size_t verbose_every_{0};
     };
 
-    // (stub) LogisticRegression — kept for future implementation
+    // (stub) LogisticRegression — inchangé
     class LogisticRegression final : public Model
     {
     public:
@@ -184,7 +353,7 @@ namespace vix::ai::ml
         {
             (void)x;
             return 0.5;
-        } // probability placeholder
+        }
     };
 
 } // namespace vix::ai::ml
