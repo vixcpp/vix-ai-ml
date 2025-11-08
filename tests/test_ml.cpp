@@ -16,6 +16,7 @@
 #include <random>
 #include <cmath>
 #include <cstdlib>
+#include <algorithm>
 
 using namespace vix::ai::ml;
 
@@ -38,22 +39,46 @@ int main()
         y.push_back(2.0 * x + 1.0 + noise(rng));
     }
 
-    // Optional scaling (helps convergence on some datasets)
+    // Optional scaling (usually helps convergence for GD-based methods)
     StandardScaler scaler;
     Mat Xs = scaler.fit_transform(X);
 
+    // -------- GD / Mini-batch + L2 + Early-stopping --------
     LinearRegression lr;
-    lr.set_hyperparams(0.1, 3000); // learning rate, iterations
+    lr.set_hyperparams(
+        /*lr*/ 0.05,
+        /*iters*/ 3000,
+        /*batch_size*/ 32, // mini-batch
+        /*l2*/ 1e-4,       // ridge
+        /*shuffle*/ true,
+        /*tol*/ 1e-9, // early stopping tolerance
+        /*patience*/ 50,
+        /*verbose_every*/ 0);
     lr.fit(Xs, y);
 
     const Vec yhat = lr.predict(Xs);
     const double loss = mse(y, yhat);
-    std::cout << "[LR] MSE: " << loss << "\n";
+    std::cout << "[LR:GD] MSE: " << loss << "\n";
 
-    // Basic sanity check: MSE should be reasonably small with this setup
+    // Basic sanity check
     if (!(loss < 0.2))
     {
-        std::cerr << "[LR] MSE too high: " << loss << " (expected < 0.2)\n";
+        std::cerr << "[LR:GD] MSE too high: " << loss << " (expected < 0.2)\n";
+        return EXIT_FAILURE;
+    }
+
+    // -------- Closed-form (Normal Equation) with Ridge (b not regularized) --------
+    LinearRegression lr_cf;
+    lr_cf.fit_closed_form(Xs, y, /*l2=*/1e-4);
+    const Vec yhat_cf = lr_cf.predict(Xs);
+    const double loss_cf = mse(y, yhat_cf);
+    std::cout << "[LR:ClosedForm] MSE: " << loss_cf << "\n";
+
+    // Closed-form should be competitive with GD
+    if (!(loss_cf <= loss * 1.5))
+    {
+        std::cerr << "[LR:ClosedForm] Unexpectedly worse MSE: " << loss_cf
+                  << " vs GD " << loss << "\n";
         return EXIT_FAILURE;
     }
 
@@ -89,14 +114,13 @@ int main()
     for (const auto &c : C)
         std::cout << "  (" << c[0] << ", " << c[1] << ")\n";
 
-    // Sanity checks
     if (C.size() != 2 || C[0].size() != 2 || C[1].size() != 2)
     {
         std::cerr << "[KMeans] invalid centers shape\n";
         return EXIT_FAILURE;
     }
 
-    // A point near (0,0) should be labeled close to the first blob (deterministic seed)
+    // A point near (0,0) should be labeled 0 or 1 deterministically (depending on init)
     const double lbl = km.predict_one({0.0, 0.0});
     if (!(lbl == 0.0 || lbl == 1.0))
     {
